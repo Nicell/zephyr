@@ -43,6 +43,13 @@ LOG_MODULE_REGISTER(ls0xx, CONFIG_DISPLAY_LOG_LEVEL);
 #define LS0XX_BIT_CLEAR       0x04
 
 struct ls0xx_data {
+#if !DT_INST_NODE_HAS_PROP(0, extcomin_gpios)
+	bool vcom_state;
+#endif
+};
+
+struct ls0xx_config {
+	struct spi_dt_spec bus;
 #if DT_INST_NODE_HAS_PROP(0, disp_en_gpios)
 	const struct device *disp_dev;
 #endif
@@ -50,30 +57,6 @@ struct ls0xx_data {
 	const struct device *extcomin_dev;
 #endif
 };
-
-struct ls0xx_config {
-	struct spi_dt_spec bus;
-};
-
-#if DT_INST_NODE_HAS_PROP(0, extcomin_gpios)
-/* Driver will handle VCOM toggling */
-static void ls0xx_vcom_toggle(void *a, void *b, void *c)
-{
-	struct ls0xx_data *driver = (struct ls0xx_data *)a;
-
-	while (1) {
-		gpio_pin_toggle(driver->extcomin_dev,
-				DT_INST_GPIO_PIN(0, extcomin_gpios));
-		k_usleep(3);
-		gpio_pin_toggle(driver->extcomin_dev,
-				DT_INST_GPIO_PIN(0, extcomin_gpios));
-		k_msleep(1000 / DT_INST_PROP(0, extcomin_frequency));
-	}
-}
-
-K_THREAD_STACK_DEFINE(vcom_toggle_stack, 256);
-struct k_thread vcom_toggle_thread;
-#endif
 
 static int ls0xx_blanking_off(const struct device *dev)
 {
@@ -106,6 +89,12 @@ static int ls0xx_cmd(const struct device *dev, uint8_t *buf, uint8_t len)
 	const struct ls0xx_config *config = dev->config;
 	struct spi_buf cmd_buf = { .buf = buf, .len = len };
 	struct spi_buf_set buf_set = { .buffers = &cmd_buf, .count = 1 };
+
+#if !DT_INST_NODE_HAS_PROP(0, extcomin_gpios)
+	struct ls0xx_data *data = dev->data;
+	buf[0] |= data->vcom_state ? LS0XX_BIT_VCOM : 0;
+	data->vcom_state = !data->vcom_state;
+#endif
 
 	return spi_write_dt(&config->bus, &buf_set);
 }
@@ -210,6 +199,31 @@ static int ls0xx_write(const struct device *dev, const uint16_t x,
 	return ls0xx_update_display(dev, y + 1, desc->height, buf);
 }
 
+/* Driver will handle VCOM toggling */
+static void ls0xx_vcom_toggle(void *a, void *b, void *c)
+{
+	const struct device *dev = a;
+	const struct ls0xx_config *config = dev->config;
+
+	while (1) {
+#if DT_INST_NODE_HAS_PROP(0, extcomin_gpios)
+		gpio_pin_toggle_dt(&config->extcomin_gpio);
+		k_usleep(3);
+		gpio_pin_toggle_dt(&config->extcomin_gpio);
+		k_msleep(1000 / DT_INST_PROP(0, extcomin_frequency));
+#else
+		uint8_t empty_cmd[2] = { 0, 0 };
+		/* Send empty command to toggle VCOM */
+		ls0xx_cmd(dev, empty_cmd, sizeof(empty_cmd));
+		spi_release_dt(&config->bus);
+		k_msleep(1000);
+#endif
+	}
+}
+
+K_THREAD_STACK_DEFINE(vcom_toggle_stack, 256);
+struct k_thread vcom_toggle_thread;
+
 static int ls0xx_read(const struct device *dev, const uint16_t x,
 		      const uint16_t y,
 		      const struct display_buffer_descriptor *desc,
@@ -270,7 +284,7 @@ static int ls0xx_set_pixel_format(const struct device *dev,
 static int ls0xx_init(const struct device *dev)
 {
 	const struct ls0xx_config *config = dev->config;
-	struct ls0xx_data *driver = dev->data;
+	struct ls0xx_data *data = dev->data;
 
 	if (!spi_is_ready(&config->bus)) {
 		LOG_ERR("SPI bus %s not ready", config->bus.bus->name);
@@ -298,25 +312,25 @@ static int ls0xx_init(const struct device *dev)
 		return -EIO;
 	}
 	LOG_INF("Configuring EXTCOMIN pin");
-	gpio_pin_configure(driver->extcomin_dev,
-			   DT_INST_GPIO_PIN(0, extcomin_gpios),
-			   GPIO_OUTPUT_LOW);
+	gpio_pin_configure_dt(&config->extcomin_gpio, GPIO_OUTPUT_LOW);
+#else
+	data->vcom_state = false;
+#endif  /* DT_INST_NODE_HAS_PROP(0, extcomin_gpios) */
 
 	/* Start thread for toggling VCOM */
 	k_tid_t vcom_toggle_tid = k_thread_create(&vcom_toggle_thread,
 						  vcom_toggle_stack,
 						  K_THREAD_STACK_SIZEOF(vcom_toggle_stack),
 						  ls0xx_vcom_toggle,
-						  driver, NULL, NULL,
+						  (void *)dev, NULL, NULL,
 						  3, 0, K_NO_WAIT);
 	k_thread_name_set(vcom_toggle_tid, "ls0xx_vcom");
-#endif  /* DT_INST_NODE_HAS_PROP(0, extcomin_gpios) */
 
 	/* Clear display else it shows random data */
 	return ls0xx_clear(dev);
 }
 
-static struct ls0xx_data ls0xx_driver;
+static struct ls0xx_data ls0xx_data;
 
 static const struct ls0xx_config ls0xx_config = {
 	.bus = SPI_DT_SPEC_INST_GET(
@@ -338,7 +352,5 @@ static struct display_driver_api ls0xx_driver_api = {
 	.set_orientation = ls0xx_set_orientation,
 };
 
-DEVICE_DT_INST_DEFINE(0, ls0xx_init, NULL,
-		      &ls0xx_driver, &ls0xx_config,
-		      POST_KERNEL, CONFIG_DISPLAY_INIT_PRIORITY,
-		      &ls0xx_driver_api);
+DEVICE_DT_INST_DEFINE(0, ls0xx_init, NULL, &ls0xx_data, &ls0xx_config, POST_KERNEL,
+		      CONFIG_DISPLAY_INIT_PRIORITY, &ls0xx_driver_api);
